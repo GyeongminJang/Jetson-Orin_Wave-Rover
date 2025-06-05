@@ -33,7 +33,7 @@ Kp, Kd, Ki = 1.0, 0.15, 0.095
 turn_threshold = 0.7
 integral_threshold = 0.1
 integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
-cruise_speed, slow_speed = 0.45, 0.35
+cruise_speed, slow_speed = 0.5, 0.4
 
 print("Ready... (Wave Rover with Vehicle Size Detection)")
 execution, prev_err, integral = True, 0.0, 0.0
