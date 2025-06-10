@@ -1,3 +1,5 @@
+# 이 파일은 임시 저장용으로 자주 바뀔 예정 -> Cache 역할 그대로임.
+
 from __future__ import annotations
 
 from pathlib import Path
