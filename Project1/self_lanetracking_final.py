@@ -139,12 +139,12 @@ def handle_task_logic(frame: np.ndarray, throttle: float, steering: float) -> tu
             print("[STATE] SLOW MODE → NORMAL")
 
     if turn_mode:
-        if turn_mode == 'left' and now - turn_start_time < LEFT_TURN_DURATION:
+        if turn_mode == 'right' and now - turn_start_time < LEFT_TURN_DURATION:
             print(f"[STATE] TURN MODE ({turn_mode})")
-            return 0.4, 0.65 # 사실 오른쪽임
-        elif turn_mode == 'right' and now - turn_start_time < RIGHT_TURN_DURATION:
+            return 0.4, 0.65 
+        elif turn_mode == 'left' and now - turn_start_time < RIGHT_TURN_DURATION:
             print(f"[STATE] TURN MODE ({turn_mode})")
-            return 0.3, -0.6 # 사실 왼쪽임
+            return 0.3, -0.6 
         else:
             turn_mode = None
             turn_handled = False
