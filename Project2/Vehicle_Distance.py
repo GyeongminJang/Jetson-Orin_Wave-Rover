@@ -1,5 +1,3 @@
-# 추후 테스트 필요
-
 from __future__ import annotations
 import time
 import numpy as np
@@ -43,8 +41,11 @@ def adjust_throttle_for_safety(throttle: float, cruise_speed: float, boxes, yolo
         z_dist = depth_map[center_y, center_x, 2]  # Z축(깊이) 거리 추출
         if 0 < z_dist < 10:
             vehicle_dists.append(z_dist)
+    
+    # 거리 정보 실시간 출력
     if vehicle_dists:
         min_dist = min(vehicle_dists)
+        print(f"[DISTANCE] Closest vehicle: {min_dist:.2f}m")  # 가장 가까운 차량과의 거리 출력
         if min_dist < safe_stop:
             print(f"[SAFE] Vehicle very close ({min_dist:.2f}m) → STOP")
             return 0.0  # 너무 가까우면 정지
@@ -52,6 +53,9 @@ def adjust_throttle_for_safety(throttle: float, cruise_speed: float, boxes, yolo
             scaled_throttle = np.clip((min_dist - safe_stop) / (safe_slow - safe_stop), 0.2, cruise_speed)
             print(f"[SAFE] Vehicle ahead ({min_dist:.2f}m) → SLOW DOWN to {scaled_throttle:.2f}")
             return scaled_throttle  # 가까우면 속도 줄임
+    else:
+        print("[DISTANCE] No obstacles detected")  # 장애물 없을 때 출력
+    
     return throttle  # 안전하면 원래 속도 유지
 
 # ========== 카메라 및 제어 초기화 ==========
