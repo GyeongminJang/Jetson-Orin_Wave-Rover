@@ -124,14 +124,14 @@ try:
 
         # ===== 주행 상태에 따라 안전 거리 조절 =====
         if abs(steering) < 0.2:
-            safe_stop = 1.5
-            safe_slow = 2.5
-        elif abs(steering) < 0.5:
             safe_stop = 1.2
             safe_slow = 2.0
+        elif abs(steering) < 0.5:
+            safe_stop = 0.9
+            safe_slow = 1.5
         else:
-            safe_stop = 1.0
-            safe_slow = 1.8
+            safe_stop = 0.5
+            safe_slow = 0.8
 
         throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed  # 조향이 크면 감속
         throttle = adjust_throttle_for_safety(throttle, cruise_speed, boxes, yolo_names, depth_map, safe_stop, safe_slow)  # 전방 차량에 따라 속도 조절
