@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Sequence
 import argparse
@@ -8,7 +9,6 @@ import logging
 import numpy as np
 import os
 import time
-
 import torch
 import torchvision
 import PIL.Image
@@ -54,8 +54,8 @@ class Camera:
         sensor_id: int | Sequence[int] = 0,
         width: int = 1280,
         height: int = 720,
-        _width: int = 640,
-        _height: int = 360,
+        _width: int = 1280,
+        _height: int = 720,
         frame_rate: int = 30,
         flip_method: int = 0,
         window_title: str = "Camera",
@@ -164,13 +164,9 @@ class Camera:
 
                     throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
 
-                    # ===== Wave Rover 모터 제어 =====
-                    if base_ctrl is not None:
-                        L = float(np.clip(throttle + steering, -1.0, 1.0))
-                        R = float(np.clip(throttle - steering, -1.0, 1.0))
-                        base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
-
-                    # ===== YOLO 탐지 및 시각화 =====
+                    # ===== YOLO 탐지 및 height 판별 =====
+                    stop_due_to_height = False
+                    max_height = 0
                     if self.model is not None:
                         pred = list(self.model(frame, stream=True))
                         for r in pred:
@@ -178,7 +174,23 @@ class Camera:
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                                 height = y2 - y1
                                 print(f"[HEIGHT] {height}px")
+                                if height > max_height:
+                                    max_height = height
                         self.visualize_pred_fn(frame, pred)
+
+                        # height가 450px 이상이면 정지
+                        if max_height >= 450:
+                            stop_due_to_height = True
+
+                    # ===== Wave Rover 모터 제어 =====
+                    if base_ctrl is not None:
+                        if stop_due_to_height:
+                            base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
+                            print("[STOP] Object height >= 500px detected. Rover stopped.")
+                        else:
+                            L = float(np.clip(throttle + steering, -1.0, 1.0))
+                            R = float(np.clip(throttle - steering, -1.0, 1.0))
+                            base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
 
                     if self.save:
                         cv2.imwrite(str(self.save_path / f"{timestamp}.jpg"), frame)
@@ -242,5 +254,5 @@ if __name__ == '__main__':
         model = YOLO(args.yolo_model_file, task='detect')
         cam.set_model(model, classes)
 
-    # 메인 루프 실행 (차선 추종 + YOLO 시각화)
+    # 메인 루프 실행 (차선 추종 + YOLO 시각화 + height 기반 정지)
     cam.run(lane_model, device, preprocess, base_ctrl=base)
