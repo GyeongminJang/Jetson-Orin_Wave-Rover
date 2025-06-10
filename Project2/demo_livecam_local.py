@@ -1,40 +1,36 @@
 from __future__ import annotations
+from pathlib import Path
+from typing import Sequence
+
 import argparse
 import cv2
 import datetime
+import glob
 import logging
 import numpy as np
 import os
 import time
-from pathlib import Path
-from typing import Sequence
 
-from ultralytics import YOLO
+
+# from jtop import jtop # Use this to monitor compute usage (for Jetson Nano)
 
 logging.getLogger().setLevel(logging.INFO)
 
+
 def draw_boxes(image, pred, classes, colors):
-    """YOLOv8 탐지 결과 시각화 (높이 정보 추가)"""
+    """Visualize YOLOv8 detection results"""
     for r in pred:
         for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy)
-            score = round(float(box.conf), 2)
-            label = int(box.cls)
-            height = y2 - y1  # 높이 계산
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            score = round(float(box.conf[0]), 2)
+            label = int(box.cls[0])
 
             color = colors[label].tolist()
             cls_name = classes[label]
 
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            # 텍스트에 높이 정보 추가
-            cv2.putText(image, 
-                        f"{cls_name} {score} H:{height}px",  # H: 높이(픽셀)
-                        (x1, max(0, y1 - 10)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.5, 
-                        color, 
-                        1, 
-                        cv2.LINE_AA)
+            cv2.putText(image, f"{cls_name} {score}", (x1, max(0, y1 - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
 
 class Camera:
     def __init__(
@@ -66,19 +62,25 @@ class Camera:
         self.log = log
         self.model = None
 
+        # Check if OpenCV is built with GStreamer support
+        # print(cv2.getBuildInformation())
+
         if isinstance(sensor_id, int):
             self.sensor_id = [sensor_id]
         elif isinstance(sensor_id, Sequence) and len(sensor_id) > 1:
             raise NotImplementedError("Multiple cameras are not supported yet")
 
-        self.cap = [cv2.VideoCapture(self.gstreamer_pipeline(sensor_id = id),
-                        cv2.CAP_GSTREAMER) for id in self.sensor_id]
+        # To flip the image, modify the flip_method parameter (0 and 2 are the most common)
+        self.cap = [cv2.VideoCapture(self.gstreamer_pipeline(sensor_id = id), \
+        				cv2.CAP_GSTREAMER) for id in self.sensor_id]
 
+        # Make record directory
         if save:
             assert save_path is not None, "Please provide a save path"
-            os.makedirs(self.save_path, exist_ok=True)
+            os.makedirs(self.save_path, exist_ok=True) # if path does not exist, create it
             self.save_path = self.save_path / f'{len(os.listdir(self.save_path)) + 1:06d}'
             os.makedirs(self.save_path, exist_ok=True)
+
             logging.info(f"Save directory: {self.save_path}")
 
     def gstreamer_pipeline(self, sensor_id: int) -> str:
@@ -108,7 +110,7 @@ class Camera:
         Set a YOLO model
         """
         self.model = model
-        self.classes = classes
+        self.classes = classes                
         self.colors = np.random.randn(len(self.classes), 3)
         self.colors = (self.colors * 255.0).astype(np.uint8)
         self.visualize_pred_fn = lambda img, pred: draw_boxes(img, pred, self.classes, self.colors)
@@ -130,12 +132,6 @@ class Camera:
                     if self.model is not None:
                         # run model
                         pred = self.model(frame, stream=True)
-                        # 높이 정보 터미널 출력
-                        for r in pred:
-                            for box in r.boxes:
-                                x1, y1, x2, y2 = map(int, box.xyxy)
-                                height = y2 - y1
-                                print(f"[LOG] Detected object height: {height} pixels")  # 터미널 로그
                         # visualize prediction
                         self.visualize_pred_fn(frame, pred)
 
@@ -161,11 +157,13 @@ class Camera:
     def frame(self) -> np.ndarray:
         """
         !!! Important: This method is not efficient for real-time rendering !!!
+
         [Example Usage]
         ...
         frame = cam.frame # Get the current frame from camera
         cv2.imshow('Camera', frame)
         ...
+
         """
         if self.cap[0].isOpened():
             return self.cap[0].read()[1]
@@ -211,6 +209,7 @@ if __name__ == '__main__':
         log = args.log)
 
     if args.yolo_model_file is not None:
+        from ultralytics import YOLO
         # HACK: TensorRT YOLO model doesn't have classes info.
         classes = YOLO("/home/ircv1/HYU-ECL3003/rover/runs/detect/train/weights/best.pt", task='detect').names
 
