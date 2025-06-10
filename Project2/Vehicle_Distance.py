@@ -39,7 +39,7 @@ def adjust_throttle_for_safety(throttle: float, cruise_speed: float, boxes, yolo
         if center_y >= depth_map.shape[0] or center_x >= depth_map.shape[1]:
             continue
         z_dist = depth_map[center_y, center_x, 2]  # Z축(깊이) 거리 추출
-        if 0 < z_dist < 2.0:
+        if 0 < z_dist < 2.5:
             vehicle_dists.append(z_dist)
     
     # 거리 정보 실시간 출력
