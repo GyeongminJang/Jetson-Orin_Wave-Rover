@@ -131,13 +131,15 @@ class Camera:
         last_time = time.time()
 
         # === 상태 머신 관련 변수 ===
-        state = "RUNNING"           # 현재 상태: RUNNING, STOPPED, WAITING, OVERTAKE
-        last_stop_time = None       # 정지 시작 시각
-        overtake_triggered = False  # 추월 플래그
-
-        # 추월 동작 파라미터
-        overtake_duration = 2.0     # 추월 조향 지속 시간(초)
+        state = "RUNNING"  # RUNNING, STOPPED, WAITING, OVERTAKE
+        last_stop_time = None
+        overtake_phase = None  # None, 'LEFT', 'STRAIGHT', 'RIGHT'
         overtake_start_time = None
+
+        # 추월 각 단계별 지속 시간(초) - 환경에 맞게 조정
+        overtake_left_duration = 1.0     # 좌측 조향 (차선 이탈)
+        overtake_straight_duration = 2.0 # 직진 (추월)
+        overtake_right_duration = 1.0    # 우측 조향 (차선 복귀)
 
         if self.stream:
             cv2.namedWindow(self.window_title)
@@ -192,7 +194,7 @@ class Camera:
                             # 앞차가 가까워지면 정지로 전환
                             state = "STOPPED"
                             last_stop_time = now
-                            overtake_triggered = False
+                            overtake_phase = None
                             if base_ctrl is not None:
                                 base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
                             print("[STOP] Object height >= 350px detected. Rover stopped.")
@@ -215,9 +217,9 @@ class Camera:
                         elif now - last_stop_time >= 5.0:
                             # 5초 경과 시 추월로 전환
                             state = "OVERTAKE"
+                            overtake_phase = "LEFT"
                             overtake_start_time = now
-                            overtake_triggered = True
-                            print("[OVERTAKE] 5 seconds elapsed. Initiating overtake.")
+                            print("[OVERTAKE] 5 seconds elapsed. Initiating overtake (LEFT phase).")
                         else:
                             # 5초 대기 중
                             state = "WAITING"
@@ -234,28 +236,55 @@ class Camera:
                         elif now - last_stop_time >= 5.0:
                             # 5초 경과 시 추월로 전환
                             state = "OVERTAKE"
+                            overtake_phase = "LEFT"
                             overtake_start_time = now
-                            overtake_triggered = True
-                            print("[OVERTAKE] 5 seconds elapsed. Initiating overtake.")
+                            print("[OVERTAKE] 5 seconds elapsed. Initiating overtake (LEFT phase).")
                         else:
                             # 계속 정지
                             if base_ctrl is not None:
                                 base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
 
                     elif state == "OVERTAKE":
-                        # 간단한 추월 예시: 일정 시간 좌측 조향 후 원위치 복귀
-                        if overtake_triggered and (now - overtake_start_time) < overtake_duration:
-                            # 좌측으로 강하게 조향하여 추월
-                            overtake_steering = 0.8  # 좌측 조향 값
-                            if base_ctrl is not None:
-                                L = float(np.clip(slow_speed + overtake_steering, -1.0, 1.0))
-                                R = float(np.clip(slow_speed - overtake_steering, -1.0, 1.0))
-                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
-                        else:
-                            # 추월 완료 후 RUNNING 복귀
-                            state = "RUNNING"
-                            overtake_triggered = False
-                            print("[OVERTAKE] Overtake maneuver complete. Resume driving.")
+                        # 3단계 추월: LEFT(차선 이탈) → STRAIGHT(추월) → RIGHT(복귀)
+                        phase_time = now - overtake_start_time
+                        if overtake_phase == "LEFT":
+                            if phase_time < overtake_left_duration:
+                                # 좌측 조향
+                                steering = 0.8
+                                L = float(np.clip(slow_speed + steering, -1.0, 1.0))
+                                R = float(np.clip(slow_speed - steering, -1.0, 1.0))
+                                if base_ctrl is not None:
+                                    base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                            else:
+                                overtake_phase = "STRAIGHT"
+                                overtake_start_time = now
+                                print("[OVERTAKE] LEFT phase complete. STRAIGHT phase start.")
+                        elif overtake_phase == "STRAIGHT":
+                            if phase_time < overtake_straight_duration:
+                                # 직진
+                                steering = 0.0
+                                L = float(np.clip(slow_speed + steering, -1.0, 1.0))
+                                R = float(np.clip(slow_speed - steering, -1.0, 1.0))
+                                if base_ctrl is not None:
+                                    base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                            else:
+                                overtake_phase = "RIGHT"
+                                overtake_start_time = now
+                                print("[OVERTAKE] STRAIGHT phase complete. RIGHT phase start.")
+                        elif overtake_phase == "RIGHT":
+                            if phase_time < overtake_right_duration:
+                                # 우측 조향(차선 복귀)
+                                steering = -0.8
+                                L = float(np.clip(slow_speed + steering, -1.0, 1.0))
+                                R = float(np.clip(slow_speed - steering, -1.0, 1.0))
+                                if base_ctrl is not None:
+                                    base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                            else:
+                                # 추월 완료, RUNNING 복귀
+                                state = "RUNNING"
+                                overtake_phase = None
+                                overtake_start_time = None
+                                print("[OVERTAKE] RIGHT phase complete. Resume driving.")
 
                     # ===== 기타 시각화/저장/종료 =====
                     if self.save:
