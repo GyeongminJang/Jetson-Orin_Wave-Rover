@@ -1,5 +1,3 @@
-# 임시 저장용
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,67 +20,34 @@ from ultralytics import YOLO
 
 logging.getLogger().setLevel(logging.INFO)
 
-# ---- 정지 및 회피 상태 관리 클래스 ----
-
-class StopWaitManager:
-    def __init__(self, distance_thresh=350, wait_duration=5.0, movement_thresh=20):
-        self.DISTANCE_THRESHOLD = distance_thresh
-        self.WAIT_DURATION = wait_duration
-        self.MOVEMENT_THRESHOLD = movement_thresh
-        self.stop_start_time = None
-        self.prev_height = None
-        self.waiting = False
-
-    def update(self, current_height, current_time):
-        """
-        상태 반환:
-        - 'stop': 정지 (5초 이내, 앞차가 안 움직임)
-        - 'move': 정상주행 (앞차가 움직임 or 거리가 멀어짐)
-        - 'avoid': 회피 (5초 초과했는데도 앞차가 계속 안 움직임 or 차량 급후진)
-        """
-        if current_height >= self.DISTANCE_THRESHOLD:
-            if not self.waiting:
-                self.stop_start_time = current_time
-                self.prev_height = current_height
-                self.waiting = True
-                return 'stop'
-            else:
-                elapsed = current_time - self.stop_start_time
-                height_diff = abs(current_height - self.prev_height)
-                if height_diff > self.MOVEMENT_THRESHOLD:
-                    self.waiting = False
-                    return 'move'
-                elif elapsed >= self.WAIT_DURATION:
-                    return 'avoid'
-                else:
-                    return 'stop'
-        else:
-            self.waiting = False
-            return 'move'
-
 def draw_boxes(image, pred, classes, colors):
+    """YOLOv8 탐지 결과 시각화 (높이 정보 추가)"""
     for r in pred:
         for box in r.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             score = round(float(box.conf[0]), 2)
             label = int(box.cls[0])
-            height = y2 - y1
+            height = y2 - y1  # 높이 계산
             color = colors[label].tolist()
             cls_name = classes[label]
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(image,
-                        f"{cls_name} {score} H:{height}px",
-                        (x1, max(0, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1,
-                        cv2.LINE_AA)
+            cv2.putText(
+                image,
+                f"{cls_name} {score} H:{height}px",
+                (x1, max(0, y1 - 10)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                1,
+                cv2.LINE_AA
+            )
 
 def get_lane_model():
+    # 차선 추종용 CNN(AlexNet) 모델 생성
     return torchvision.models.alexnet(num_classes=2, dropout=0.0)
 
 def preprocess(image: PIL.Image.Image, device):
+    # 이미지 전처리 함수 (텐서 변환 및 배치 차원 추가)
     return TEST_TRANSFORMS(image).to(device)[None, ...]
 
 class Camera:
@@ -156,17 +121,23 @@ class Camera:
         self.visualize_pred_fn = lambda img, pred: draw_boxes(img, pred, self.classes, self.colors)
 
     def run(self, lane_model, lane_device, lane_preprocess, base_ctrl=None) -> None:
-        # PID 파라미터
+        # ==================== PID 파라미터 (중앙선 추종) ====================
         Kp, Kd, Ki = 1.0, 0.15, 0.095
         turn_threshold = 0.7
         integral_threshold = 0.1
         integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
-        cruise_speed, avoid_speed = 0.45, 0.18
+        cruise_speed, slow_speed = 0.45, 0.35
         prev_err, integral = 0.0, 0.0
         last_time = time.time()
 
-        stop_manager = StopWaitManager(distance_thresh=350, wait_duration=5.0, movement_thresh=20)
-        prev_boxes = []  # 이전 프레임 객체 위치 저장
+        # === 상태 머신 관련 변수 ===
+        state = "RUNNING"           # 현재 상태: RUNNING, STOPPED, WAITING, OVERTAKE
+        last_stop_time = None       # 정지 시작 시각
+        overtake_triggered = False  # 추월 플래그
+
+        # 추월 동작 파라미터
+        overtake_duration = 2.0     # 추월 조향 지속 시간(초)
+        overtake_start_time = None
 
         if self.stream:
             cv2.namedWindow(self.window_title)
@@ -184,7 +155,7 @@ class Camera:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     pil_img = PIL.Image.fromarray(frame_rgb)
 
-                    # === 차선 추종 PID 제어 ===
+                    # ===== 차선 추종 CNN(PID) 기반 중앙선 추종 =====
                     with torch.no_grad():
                         tensor = lane_preprocess(pil_img, lane_device)
                         out = lane_model(tensor).cpu().numpy()[0]
@@ -198,73 +169,98 @@ class Camera:
                         integral = 0.0
                     else:
                         integral = np.clip(integral + err * dt, integral_min, integral_max)
-
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
                     prev_err = err
+                    throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
 
-                    # === YOLO 객체 탐지 ===
+                    # ===== YOLO 탐지 및 height 판별 =====
                     max_height = 0
                     if self.model is not None:
                         pred = list(self.model(frame, stream=True))
-                        current_boxes = []
                         for r in pred:
                             for box in r.boxes:
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-                                xc = (x1 + x2) / 2
-                                yc = (y1 + y2) / 2
                                 height = y2 - y1
-                                current_boxes.append((xc, yc, height))
                                 if height > max_height:
                                     max_height = height
                         self.visualize_pred_fn(frame, pred)
-                    else:
-                        current_boxes = []
 
-                    # === 정지/회피/주행 판단 ===
-                    action = stop_manager.update(max_height, now)
+                    # ===== 상태 머신 기반 주행 제어 =====
+                    if state == "RUNNING":
+                        if max_height >= 450:
+                            # 앞차가 가까워지면 정지로 전환
+                            state = "STOPPED"
+                            last_stop_time = now
+                            overtake_triggered = False
+                            if base_ctrl is not None:
+                                base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
+                            print("[STOP] Object height >= 450px detected. Rover stopped.")
+                        else:
+                            # PID 기반 정상 주행
+                            if base_ctrl is not None:
+                                L = float(np.clip(throttle + steering, -1.0, 1.0))
+                                R = float(np.clip(throttle - steering, -1.0, 1.0))
+                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
 
-                    avoidance_offset = 0.0  # 기본값
+                    elif state == "STOPPED":
+                        if max_height < 450:
+                            # 앞차가 움직이면 바로 RUNNING 복귀
+                            state = "RUNNING"
+                            if base_ctrl is not None:
+                                L = float(np.clip(throttle + steering, -1.0, 1.0))
+                                R = float(np.clip(throttle - steering, -1.0, 1.0))
+                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                            print("[RESUME] Front object moved. Resume driving.")
+                        elif now - last_stop_time >= 5.0:
+                            # 5초 경과 시 추월로 전환
+                            state = "OVERTAKE"
+                            overtake_start_time = now
+                            overtake_triggered = True
+                            print("[OVERTAKE] 5 seconds elapsed. Initiating overtake.")
+                        else:
+                            # 5초 대기 중
+                            state = "WAITING"
 
-                    if action == 'avoid':
-                        # avoid 상태에서만 움직이는 객체 감지 및 회피 활성화
-                        for (xc, yc, h) in current_boxes:
-                            for (px, py, ph) in prev_boxes:
-                                if abs(xc - px) > 15 and abs(yc - py) < 30:
-                                    if xc < frame.shape[1] / 2:
-                                        avoidance_offset += 0.3
-                                    else:
-                                        avoidance_offset -= 0.3
-                                    print("[AVOID] Moving object detected! Offset:", avoidance_offset)
-                                    break
-                        throttle = avoid_speed
-                        prev_boxes = current_boxes  # 회피 상태에서만 prev_boxes 갱신
-                        print("[AVOID] Avoiding object ahead.")
+                    elif state == "WAITING":
+                        if max_height < 450:
+                            # 앞차가 움직이면 RUNNING 복귀
+                            state = "RUNNING"
+                            if base_ctrl is not None:
+                                L = float(np.clip(throttle + steering, -1.0, 1.0))
+                                R = float(np.clip(throttle - steering, -1.0, 1.0))
+                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                            print("[RESUME] Front object moved. Resume driving.")
+                        elif now - last_stop_time >= 5.0:
+                            # 5초 경과 시 추월로 전환
+                            state = "OVERTAKE"
+                            overtake_start_time = now
+                            overtake_triggered = True
+                            print("[OVERTAKE] 5 seconds elapsed. Initiating overtake.")
+                        else:
+                            # 계속 정지
+                            if base_ctrl is not None:
+                                base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
 
-                    elif action == 'stop':
-                        throttle = 0.0
-                        L = R = 0.0
-                        prev_boxes = []  # stop 상태에서는 prev_boxes 초기화
-                        print("[STOP] Waiting due to close object.")
+                    elif state == "OVERTAKE":
+                        # 간단한 추월 예시: 일정 시간 좌측 조향 후 원위치 복귀
+                        if overtake_triggered and (now - overtake_start_time) < overtake_duration:
+                            # 좌측으로 강하게 조향하여 추월
+                            overtake_steering = 0.8  # 좌측 조향 값
+                            if base_ctrl is not None:
+                                L = float(np.clip(slow_speed + overtake_steering, -1.0, 1.0))
+                                R = float(np.clip(slow_speed - overtake_steering, -1.0, 1.0))
+                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                        else:
+                            # 추월 완료 후 RUNNING 복귀
+                            state = "RUNNING"
+                            overtake_triggered = False
+                            print("[OVERTAKE] Overtake maneuver complete. Resume driving.")
 
-                    else:  # move
-                        throttle = cruise_speed if abs(steering) < turn_threshold else avoid_speed
-                        prev_boxes = []  # move 상태에서는 prev_boxes 초기화
-
-                    # === 최종 주행 제어 ===
-                    final_steering = np.clip(steering + avoidance_offset, -1.0, 1.0)
-                    if action != 'stop':
-                        L = float(np.clip(throttle + final_steering, -1.0, 1.0))
-                        R = float(np.clip(throttle - final_steering, -1.0, 1.0))
-
-                    if base_ctrl is not None:
-                        base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
-
+                    # ===== 기타 시각화/저장/종료 =====
                     if self.save:
                         cv2.imwrite(str(self.save_path / f"{timestamp}.jpg"), frame)
-
                     if self.log:
                         print(f"FPS: {1 / (time.time() - t0):.2f}")
-
                     if self.stream:
                         cv2.imshow(self.window_title, frame)
                         if cv2.waitKey(1) == ord('q'):
@@ -293,17 +289,20 @@ if __name__ == '__main__':
     parser.add_argument('--baudrate', type=int, default=115200, help='Serial baudrate')
     args = parser.parse_args()
 
+    # 차선 추종 모델 준비
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     lane_model = get_lane_model().to(device)
     lane_model.load_state_dict(torch.load(args.lane_model_file, map_location=device))
     lane_model.eval()
 
+    # Wave Rover 모터 제어기 준비
     try:
         base = BaseController(args.base_serial, args.baudrate)
     except Exception as e:
         print(f"BaseController init failed: {e}")
         base = None
 
+    # 카메라 준비
     cam = Camera(
         sensor_id=args.sensor_id,
         window_title=args.window_title,
@@ -312,9 +311,11 @@ if __name__ == '__main__':
         stream=args.stream,
         log=args.log)
 
+    # YOLO 모델 준비 (선택)
     if args.yolo_model_file:
         classes = YOLO(args.yolo_model_file, task='detect').names
         model = YOLO(args.yolo_model_file, task='detect')
         cam.set_model(model, classes)
 
+    # 메인 루프 실행 (차선 추종 + YOLO 시각화 + height 기반 정지 + 추월)
     cam.run(lane_model, device, preprocess, base_ctrl=base)
