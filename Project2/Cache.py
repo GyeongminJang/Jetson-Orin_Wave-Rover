@@ -159,7 +159,7 @@ class Camera:
         self.visualize_pred_fn = lambda img, pred: draw_boxes(img, pred, self.classes, self.colors)
 
     def run(self, lane_model, lane_device, lane_preprocess, base_ctrl=None) -> None:
-        # ===== PID 파라미터 (중앙선 추종) =====
+        # PID 파라미터
         Kp, Kd, Ki = 1.0, 0.15, 0.095
         turn_threshold = 0.7
         integral_threshold = 0.1
@@ -169,6 +169,9 @@ class Camera:
         last_time = time.time()
 
         stop_manager = StopWaitManager(distance_thresh=450, wait_duration=5.0, movement_thresh=20)
+        prev_boxes = []  # 이전 프레임 객체 위치 저장
+        avoidance_timer = 0.0
+        avoidance_duration = 1.5  # 초 단위 회피 유지 시간
 
         if self.stream:
             cv2.namedWindow(self.window_title)
@@ -186,7 +189,7 @@ class Camera:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     pil_img = PIL.Image.fromarray(frame_rgb)
 
-                    # ===== 차선 추종 CNN(PID) 기반 중앙선 추종 =====
+                    # === 차선 추종 PID 제어 ===
                     with torch.no_grad():
                         tensor = lane_preprocess(pil_img, lane_device)
                         out = lane_model(tensor).cpu().numpy()[0]
@@ -204,20 +207,40 @@ class Camera:
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
                     prev_err = err
 
-                    # ===== YOLO 탐지 및 height 측정 =====
+                    # === YOLO 객체 탐지 및 이동 객체 회피 ===
                     max_height = 0
+                    avoidance_offset = 0.0
+                    current_boxes = []
+
                     if self.model is not None:
                         pred = list(self.model(frame, stream=True))
                         for r in pred:
                             for box in r.boxes:
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
+                                xc = (x1 + x2) / 2
+                                yc = (y1 + y2) / 2
                                 height = y2 - y1
-                                print(f"[HEIGHT] {height}px")
+                                current_boxes.append((xc, yc, height))
                                 if height > max_height:
                                     max_height = height
+
+                        # === 움직이는 객체 감지 및 회피 ===
+                        if now - avoidance_timer >= avoidance_duration:
+                            for (xc, yc, h) in current_boxes:
+                                for (px, py, ph) in prev_boxes:
+                                    if abs(xc - px) > 15 and abs(yc - py) < 30:
+                                        if xc < frame.shape[1] / 2:
+                                            avoidance_offset += 0.3
+                                        else:
+                                            avoidance_offset -= 0.3
+                                        avoidance_timer = now
+                                        print("[AVOID] Moving object detected! Offset:", avoidance_offset)
+                                        break
+
+                        prev_boxes = current_boxes
                         self.visualize_pred_fn(frame, pred)
 
-                    # ===== 정지/서행/주행 상태 결정 =====
+                    # === 정지/서행/주행 판단 ===
                     action = stop_manager.update(max_height, now)
                     if action == 'stop':
                         throttle = 0.0
@@ -225,14 +248,14 @@ class Camera:
                         print("[STOP] Waiting due to close object.")
                     elif action == 'slow':
                         throttle = slow_speed
-                        L = float(np.clip(throttle + steering, -1.0, 1.0))
-                        R = float(np.clip(throttle - steering, -1.0, 1.0))
-                        print("[SLOW] Slow driving after waiting.")
-                    else:  # 'move'
+                    else:
                         throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
-                        L = float(np.clip(throttle + steering, -1.0, 1.0))
-                        R = float(np.clip(throttle - steering, -1.0, 1.0))
-                        print("[MOVE] Normal driving.")
+
+                    # === 최종 주행 제어 ===
+                    final_steering = np.clip(steering + avoidance_offset, -1.0, 1.0)
+                    if action != 'stop':
+                        L = float(np.clip(throttle + final_steering, -1.0, 1.0))
+                        R = float(np.clip(throttle - final_steering, -1.0, 1.0))
 
                     if base_ctrl is not None:
                         base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
@@ -256,6 +279,7 @@ class Camera:
                 if base_ctrl is not None:
                     base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
                     print("Motors stopped.")
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
