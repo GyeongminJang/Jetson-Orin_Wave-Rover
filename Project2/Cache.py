@@ -183,18 +183,19 @@ class Camera:
                                 height = y2 - y1
                                 if height > max_height:
                                     max_height = height
+                        print(f"Max height: {max_height}px")
                         self.visualize_pred_fn(frame, pred)
 
                     # ===== 상태 머신 기반 주행 제어 =====
                     if state == "RUNNING":
-                        if max_height >= 450:
+                        if max_height >= 350:
                             # 앞차가 가까워지면 정지로 전환
                             state = "STOPPED"
                             last_stop_time = now
                             overtake_triggered = False
                             if base_ctrl is not None:
                                 base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                            print("[STOP] Object height >= 450px detected. Rover stopped.")
+                            print("[STOP] Object height >= 350px detected. Rover stopped.")
                         else:
                             # PID 기반 정상 주행
                             if base_ctrl is not None:
@@ -203,7 +204,7 @@ class Camera:
                                 base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
 
                     elif state == "STOPPED":
-                        if max_height < 450:
+                        if max_height < 350:
                             # 앞차가 움직이면 바로 RUNNING 복귀
                             state = "RUNNING"
                             if base_ctrl is not None:
@@ -222,7 +223,7 @@ class Camera:
                             state = "WAITING"
 
                     elif state == "WAITING":
-                        if max_height < 450:
+                        if max_height < 350:
                             # 앞차가 움직이면 RUNNING 복귀
                             state = "RUNNING"
                             if base_ctrl is not None:
