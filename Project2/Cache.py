@@ -23,7 +23,7 @@ logging.getLogger().setLevel(logging.INFO)
 
 # ---- 정지 및 서행 상태 관리 클래스 ----
 class StopWaitManager:
-    def __init__(self, distance_thresh=450, wait_duration=5.0, movement_thresh=20):
+    def __init__(self, distance_thresh=350, wait_duration=5.0, movement_thresh=20):
         self.DISTANCE_THRESHOLD = distance_thresh
         self.WAIT_DURATION = wait_duration
         self.MOVEMENT_THRESHOLD = movement_thresh
@@ -36,7 +36,7 @@ class StopWaitManager:
         상태 반환:
         - 'stop': 정지 (5초 이내, 앞차가 안 움직임)
         - 'move': 정상주행 (앞차가 움직임 or 거리가 멀어짐)
-        - 'slow': 서행 (5초 초과, 앞차가 계속 안 움직임)
+        - 'avoid': 회피 (5초 초과했는데도 앞차가 계속 안 움직임 or 차량 급후진)
         """
         # 1. 앞차가 가까워지면(임계값 이상) 정지 시작
         if current_height >= self.DISTANCE_THRESHOLD:
@@ -54,7 +54,7 @@ class StopWaitManager:
                     return 'move'
                 elif elapsed >= self.WAIT_DURATION:
                     # 5초 이상 대기했는데 변화 없음 → 서행
-                    return 'slow'
+                    return 'avoid'
                 else:
                     # 계속 정지
                     return 'stop'
@@ -168,7 +168,7 @@ class Camera:
         prev_err, integral = 0.0, 0.0
         last_time = time.time()
 
-        stop_manager = StopWaitManager(distance_thresh=450, wait_duration=5.0, movement_thresh=20)
+        stop_manager = StopWaitManager(distance_thresh=350, wait_duration=5.0, movement_thresh=20)
         prev_boxes = []  # 이전 프레임 객체 위치 저장
         avoidance_timer = 0.0
         avoidance_duration = 1.5  # 초 단위 회피 유지 시간
@@ -240,7 +240,7 @@ class Camera:
                         prev_boxes = current_boxes
                         self.visualize_pred_fn(frame, pred)
 
-                    # === 정지/서행/주행 판단 ===
+                    # === 정지/회피/주행 판단 ===
                     action = stop_manager.update(max_height, now)
                     if action == 'stop':
                         throttle = 0.0
