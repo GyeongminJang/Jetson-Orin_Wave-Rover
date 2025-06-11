@@ -21,8 +21,49 @@ from ultralytics import YOLO
 
 logging.getLogger().setLevel(logging.INFO)
 
+# ---- 정지 및 서행 상태 관리 클래스 ----
+class StopWaitManager:
+    def __init__(self, distance_thresh=450, wait_duration=5.0, movement_thresh=20):
+        self.DISTANCE_THRESHOLD = distance_thresh
+        self.WAIT_DURATION = wait_duration
+        self.MOVEMENT_THRESHOLD = movement_thresh
+        self.stop_start_time = None
+        self.prev_height = None
+        self.waiting = False
+
+    def update(self, current_height, current_time):
+        """
+        상태 반환:
+        - 'stop': 정지 (5초 이내, 앞차가 안 움직임)
+        - 'move': 정상주행 (앞차가 움직임 or 거리가 멀어짐)
+        - 'slow': 서행 (5초 초과, 앞차가 계속 안 움직임)
+        """
+        # 1. 앞차가 가까워지면(임계값 이상) 정지 시작
+        if current_height >= self.DISTANCE_THRESHOLD:
+            if not self.waiting:
+                self.stop_start_time = current_time
+                self.prev_height = current_height
+                self.waiting = True
+                return 'stop'
+            else:
+                elapsed = current_time - self.stop_start_time
+                height_diff = abs(current_height - self.prev_height)
+                if height_diff > self.MOVEMENT_THRESHOLD:
+                    # 앞차가 움직임(거리 변화) → 즉시 주행 재개
+                    self.waiting = False
+                    return 'move'
+                elif elapsed >= self.WAIT_DURATION:
+                    # 5초 이상 대기했는데 변화 없음 → 서행
+                    return 'slow'
+                else:
+                    # 계속 정지
+                    return 'stop'
+        else:
+            # 앞차가 멀어짐(임계값 미만) → 정상주행
+            self.waiting = False
+            return 'move'
+
 def draw_boxes(image, pred, classes, colors):
-    """YOLOv8 탐지 결과 시각화 (높이 정보 추가)"""
     for r in pred:
         for box in r.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -118,27 +159,16 @@ class Camera:
         self.visualize_pred_fn = lambda img, pred: draw_boxes(img, pred, self.classes, self.colors)
 
     def run(self, lane_model, lane_device, lane_preprocess, base_ctrl=None) -> None:
-        # ==================== PID 파라미터 (중앙선 추종) ====================
+        # ===== PID 파라미터 (중앙선 추종) =====
         Kp, Kd, Ki = 1.0, 0.15, 0.095
         turn_threshold = 0.7
         integral_threshold = 0.1
         integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
-        cruise_speed, slow_speed = 0.45, 0.18  # 서행 속도는 더 낮게
+        cruise_speed, slow_speed = 0.45, 0.18
         prev_err, integral = 0.0, 0.0
         last_time = time.time()
 
-        # ==== 상황 제어 변수 ====
-        HEIGHT_STOP_THRESH = 500
-        HEIGHT_DIFF_THRESH = 30  # height 변화량이 이 값 이하이면 "크게 변하지 않음"
-        STOP_DURATION = 5.0  # 정지 유지 시간(초)
-        stop_mode = False
-        stop_start_time = 0.0
-        prev_max_height = 0
-        slow_mode = False
-        reverse_mode = False
-        prev_vehicle_y2 = None
-        reverse_count = 0
-        REVERSE_COUNT_THRESH = 3  # 몇 프레임 연속으로 y2가 감소해야 후진으로 인식
+        stop_manager = StopWaitManager(distance_thresh=450, wait_duration=5.0, movement_thresh=20)
 
         if self.stream:
             cv2.namedWindow(self.window_title)
@@ -174,85 +204,38 @@ class Camera:
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
                     prev_err = err
 
-                    # ===== YOLO 탐지 및 상황 판단 =====
+                    # ===== YOLO 탐지 및 height 측정 =====
                     max_height = 0
-                    max_width = 0
-                    vehicle_y2 = None
                     if self.model is not None:
                         pred = list(self.model(frame, stream=True))
                         for r in pred:
                             for box in r.boxes:
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                                 height = y2 - y1
-                                width = x2 - x1
-                                print(f"[HEIGHT] {height}px [WIDTH] {width}px")
+                                print(f"[HEIGHT] {height}px")
                                 if height > max_height:
                                     max_height = height
-                                    max_width = width
-                                    vehicle_y2 = y2  # 가장 큰 height 차량의 y2 사용
                         self.visualize_pred_fn(frame, pred)
-                    else:
-                        vehicle_y2 = None
 
-                    # ====== 후진 감지 ======
-                    if prev_vehicle_y2 is not None and vehicle_y2 is not None:
-                        if vehicle_y2 < prev_vehicle_y2 - 2:  # y2가 작아지면 bbox가 위로 이동(차량이 멀어짐/후진)
-                            reverse_count += 1
-                        else:
-                            reverse_count = 0
-                        if reverse_count >= REVERSE_COUNT_THRESH:
-                            reverse_mode = True
-                        else:
-                            reverse_mode = False
-                    prev_vehicle_y2 = vehicle_y2
-
-                    # ====== 정지/서행/주행 상태 결정 ======
-                    # 1. height가 임계값 이상이면 정지
-                    if not stop_mode and max_height >= HEIGHT_STOP_THRESH:
-                        stop_mode = True
-                        stop_start_time = now
-                        prev_max_height = max_height
-                        print("[STOP] Object height >= threshold. Rover stopped.")
-
-                    # 2. 정지 상태
-                    if stop_mode:
-                        # 5초간 정지
-                        if now - stop_start_time < STOP_DURATION:
-                            throttle = 0.0
-                            L = R = 0.0
-                            if base_ctrl is not None:
-                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
-                            print(f"[STOP] {now - stop_start_time:.1f}/{STOP_DURATION}s")
-                        else:
-                            # height 변화가 크지 않으면 서행
-                            if abs(max_height - prev_max_height) < HEIGHT_DIFF_THRESH:
-                                slow_mode = True
-                                stop_mode = False
-                                print("[SLOW] Height changed little after stop, switching to slow mode.")
-                            else:
-                                # height가 충분히 줄었으면 정상 주행 재개
-                                stop_mode = False
-                                print("[RESUME] Height decreased, resume normal driving.")
-                        # 화면 표시, 저장, 로그 등은 아래에서 계속
-                    # 3. 서행 모드 (정지 후 height 변화 적거나, 후진 감지)
-                    elif slow_mode or reverse_mode:
+                    # ===== 정지/서행/주행 상태 결정 =====
+                    action = stop_manager.update(max_height, now)
+                    if action == 'stop':
+                        throttle = 0.0
+                        L = R = 0.0
+                        print("[STOP] Waiting due to close object.")
+                    elif action == 'slow':
                         throttle = slow_speed
                         L = float(np.clip(throttle + steering, -1.0, 1.0))
                         R = float(np.clip(throttle - steering, -1.0, 1.0))
-                        if base_ctrl is not None:
-                            base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
-                        print("[SLOW] Slow driving mode (after stop or reverse detected).")
-                        # slow_mode는 height가 다시 정상 범위로 돌아오면 해제
-                        if max_height < HEIGHT_STOP_THRESH - HEIGHT_DIFF_THRESH and not reverse_mode:
-                            slow_mode = False
-                            print("[RESUME] Height now normal, resume normal driving.")
-                    # 4. 기본: PID 차선 추종 주행
-                    else:
+                        print("[SLOW] Slow driving after waiting.")
+                    else:  # 'move'
                         throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
                         L = float(np.clip(throttle + steering, -1.0, 1.0))
                         R = float(np.clip(throttle - steering, -1.0, 1.0))
-                        if base_ctrl is not None:
-                            base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                        print("[MOVE] Normal driving.")
+
+                    if base_ctrl is not None:
+                        base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
 
                     if self.save:
                         cv2.imwrite(str(self.save_path / f"{timestamp}.jpg"), frame)
