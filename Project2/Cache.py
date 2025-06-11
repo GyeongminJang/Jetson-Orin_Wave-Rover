@@ -1,6 +1,7 @@
 # 임시 저장용
 
 from __future__ import annotations
+
 from pathlib import Path
 from typing import Sequence
 import argparse
@@ -21,7 +22,8 @@ from ultralytics import YOLO
 
 logging.getLogger().setLevel(logging.INFO)
 
-# ---- 정지 및 서행 상태 관리 클래스 ----
+# ---- 정지 및 회피 상태 관리 클래스 ----
+
 class StopWaitManager:
     def __init__(self, distance_thresh=350, wait_duration=5.0, movement_thresh=20):
         self.DISTANCE_THRESHOLD = distance_thresh
@@ -38,7 +40,6 @@ class StopWaitManager:
         - 'move': 정상주행 (앞차가 움직임 or 거리가 멀어짐)
         - 'avoid': 회피 (5초 초과했는데도 앞차가 계속 안 움직임 or 차량 급후진)
         """
-        # 1. 앞차가 가까워지면(임계값 이상) 정지 시작
         if current_height >= self.DISTANCE_THRESHOLD:
             if not self.waiting:
                 self.stop_start_time = current_time
@@ -49,17 +50,13 @@ class StopWaitManager:
                 elapsed = current_time - self.stop_start_time
                 height_diff = abs(current_height - self.prev_height)
                 if height_diff > self.MOVEMENT_THRESHOLD:
-                    # 앞차가 움직임(거리 변화) → 즉시 주행 재개
                     self.waiting = False
                     return 'move'
                 elif elapsed >= self.WAIT_DURATION:
-                    # 5초 이상 대기했는데 변화 없음 → 서행
                     return 'avoid'
                 else:
-                    # 계속 정지
                     return 'stop'
         else:
-            # 앞차가 멀어짐(임계값 미만) → 정상주행
             self.waiting = False
             return 'move'
 
@@ -124,7 +121,7 @@ class Camera:
             raise NotImplementedError("Multiple cameras are not supported yet")
 
         self.cap = [cv2.VideoCapture(self.gstreamer_pipeline(sensor_id=id),
-                        cv2.CAP_GSTREAMER) for id in self.sensor_id]
+                                    cv2.CAP_GSTREAMER) for id in self.sensor_id]
 
         if save:
             os.makedirs(self.save_path, exist_ok=True)
@@ -164,14 +161,12 @@ class Camera:
         turn_threshold = 0.7
         integral_threshold = 0.1
         integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
-        cruise_speed, slow_speed = 0.45, 0.18
+        cruise_speed, avoid_speed = 0.45, 0.18
         prev_err, integral = 0.0, 0.0
         last_time = time.time()
 
         stop_manager = StopWaitManager(distance_thresh=350, wait_duration=5.0, movement_thresh=20)
         prev_boxes = []  # 이전 프레임 객체 위치 저장
-        avoidance_timer = 0.0
-        avoidance_duration = 1.5  # 초 단위 회피 유지 시간
 
         if self.stream:
             cv2.namedWindow(self.window_title)
@@ -193,7 +188,7 @@ class Camera:
                     with torch.no_grad():
                         tensor = lane_preprocess(pil_img, lane_device)
                         out = lane_model(tensor).cpu().numpy()[0]
-                    err = float(out[0])
+                        err = float(out[0])
 
                     now = time.time()
                     dt = max(1e-3, now - last_time)
@@ -207,13 +202,11 @@ class Camera:
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
                     prev_err = err
 
-                    # === YOLO 객체 탐지 및 이동 객체 회피 ===
+                    # === YOLO 객체 탐지 ===
                     max_height = 0
-                    avoidance_offset = 0.0
-                    current_boxes = []
-
                     if self.model is not None:
                         pred = list(self.model(frame, stream=True))
+                        current_boxes = []
                         for r in pred:
                             for box in r.boxes:
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
@@ -223,33 +216,39 @@ class Camera:
                                 current_boxes.append((xc, yc, height))
                                 if height > max_height:
                                     max_height = height
-
-                        # === 움직이는 객체 감지 및 회피 ===
-                        if now - avoidance_timer >= avoidance_duration:
-                            for (xc, yc, h) in current_boxes:
-                                for (px, py, ph) in prev_boxes:
-                                    if abs(xc - px) > 15 and abs(yc - py) < 30:
-                                        if xc < frame.shape[1] / 2:
-                                            avoidance_offset += 0.3
-                                        else:
-                                            avoidance_offset -= 0.3
-                                        avoidance_timer = now
-                                        print("[AVOID] Moving object detected! Offset:", avoidance_offset)
-                                        break
-
-                        prev_boxes = current_boxes
                         self.visualize_pred_fn(frame, pred)
+                    else:
+                        current_boxes = []
 
                     # === 정지/회피/주행 판단 ===
                     action = stop_manager.update(max_height, now)
-                    if action == 'stop':
+
+                    avoidance_offset = 0.0  # 기본값
+
+                    if action == 'avoid':
+                        # avoid 상태에서만 움직이는 객체 감지 및 회피 활성화
+                        for (xc, yc, h) in current_boxes:
+                            for (px, py, ph) in prev_boxes:
+                                if abs(xc - px) > 15 and abs(yc - py) < 30:
+                                    if xc < frame.shape[1] / 2:
+                                        avoidance_offset += 0.3
+                                    else:
+                                        avoidance_offset -= 0.3
+                                    print("[AVOID] Moving object detected! Offset:", avoidance_offset)
+                                    break
+                        throttle = avoid_speed
+                        prev_boxes = current_boxes  # 회피 상태에서만 prev_boxes 갱신
+                        print("[AVOID] Avoiding object ahead.")
+
+                    elif action == 'stop':
                         throttle = 0.0
                         L = R = 0.0
+                        prev_boxes = []  # stop 상태에서는 prev_boxes 초기화
                         print("[STOP] Waiting due to close object.")
-                    elif action == 'slow':
-                        throttle = slow_speed
-                    else:
-                        throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
+
+                    else:  # move
+                        throttle = cruise_speed if abs(steering) < turn_threshold else avoid_speed
+                        prev_boxes = []  # move 상태에서는 prev_boxes 초기화
 
                     # === 최종 주행 제어 ===
                     final_steering = np.clip(steering + avoidance_offset, -1.0, 1.0)
@@ -278,8 +277,7 @@ class Camera:
                 cv2.destroyAllWindows()
                 if base_ctrl is not None:
                     base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                    print("Motors stopped.")
-
+                print("Motors stopped.")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
