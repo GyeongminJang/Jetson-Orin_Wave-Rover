@@ -1,7 +1,6 @@
-# 이 파일은 임시 저장용으로 자주 바뀔 예정 -> Cache 역할 그대로임.
+# 임시 저장용
 
 from __future__ import annotations
-
 from pathlib import Path
 from typing import Sequence
 import argparse
@@ -29,7 +28,7 @@ def draw_boxes(image, pred, classes, colors):
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             score = round(float(box.conf[0]), 2)
             label = int(box.cls[0])
-            height = y2 - y1  # 높이 계산
+            height = y2 - y1
             color = colors[label].tolist()
             cls_name = classes[label]
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
@@ -43,11 +42,9 @@ def draw_boxes(image, pred, classes, colors):
                         cv2.LINE_AA)
 
 def get_lane_model():
-    # 차선 추종용 CNN(AlexNet) 모델 생성
     return torchvision.models.alexnet(num_classes=2, dropout=0.0)
 
 def preprocess(image: PIL.Image.Image, device):
-    # 이미지 전처리 함수 (텐서 변환 및 배치 차원 추가)
     return TEST_TRANSFORMS(image).to(device)[None, ...]
 
 class Camera:
@@ -56,8 +53,8 @@ class Camera:
         sensor_id: int | Sequence[int] = 0,
         width: int = 1280,
         height: int = 720,
-        _width: int = 640,
-        _height: int = 360,
+        _width: int = 1280,
+        _height: int = 720,
         frame_rate: int = 30,
         flip_method: int = 0,
         window_title: str = "Camera",
@@ -126,9 +123,22 @@ class Camera:
         turn_threshold = 0.7
         integral_threshold = 0.1
         integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
-        cruise_speed, slow_speed = 0.45, 0.35
+        cruise_speed, slow_speed = 0.45, 0.18  # 서행 속도는 더 낮게
         prev_err, integral = 0.0, 0.0
         last_time = time.time()
+
+        # ==== 상황 제어 변수 ====
+        HEIGHT_STOP_THRESH = 500
+        HEIGHT_DIFF_THRESH = 30  # height 변화량이 이 값 이하이면 "크게 변하지 않음"
+        STOP_DURATION = 5.0  # 정지 유지 시간(초)
+        stop_mode = False
+        stop_start_time = 0.0
+        prev_max_height = 0
+        slow_mode = False
+        reverse_mode = False
+        prev_vehicle_y2 = None
+        reverse_count = 0
+        REVERSE_COUNT_THRESH = 3  # 몇 프레임 연속으로 y2가 감소해야 후진으로 인식
 
         if self.stream:
             cv2.namedWindow(self.window_title)
@@ -164,34 +174,84 @@ class Camera:
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
                     prev_err = err
 
-                    throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
-
-                    # ===== YOLO 탐지 및 height 판별 =====
-                    stop_due_to_height = False
+                    # ===== YOLO 탐지 및 상황 판단 =====
                     max_height = 0
+                    max_width = 0
+                    vehicle_y2 = None
                     if self.model is not None:
                         pred = list(self.model(frame, stream=True))
                         for r in pred:
                             for box in r.boxes:
                                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                                 height = y2 - y1
-                                print(f"[HEIGHT] {height}px")
+                                width = x2 - x1
+                                print(f"[HEIGHT] {height}px [WIDTH] {width}px")
                                 if height > max_height:
                                     max_height = height
+                                    max_width = width
+                                    vehicle_y2 = y2  # 가장 큰 height 차량의 y2 사용
                         self.visualize_pred_fn(frame, pred)
+                    else:
+                        vehicle_y2 = None
 
-                        # height가 500px 이상이면 정지
-                        if max_height >= 500:
-                            stop_due_to_height = True
-
-                    # ===== Wave Rover 모터 제어 =====
-                    if base_ctrl is not None:
-                        if stop_due_to_height:
-                            base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                            print("[STOP] Object height >= 500px detected. Rover stopped.")
+                    # ====== 후진 감지 ======
+                    if prev_vehicle_y2 is not None and vehicle_y2 is not None:
+                        if vehicle_y2 < prev_vehicle_y2 - 2:  # y2가 작아지면 bbox가 위로 이동(차량이 멀어짐/후진)
+                            reverse_count += 1
                         else:
-                            L = float(np.clip(throttle + steering, -1.0, 1.0))
-                            R = float(np.clip(throttle - steering, -1.0, 1.0))
+                            reverse_count = 0
+                        if reverse_count >= REVERSE_COUNT_THRESH:
+                            reverse_mode = True
+                        else:
+                            reverse_mode = False
+                    prev_vehicle_y2 = vehicle_y2
+
+                    # ====== 정지/서행/주행 상태 결정 ======
+                    # 1. height가 임계값 이상이면 정지
+                    if not stop_mode and max_height >= HEIGHT_STOP_THRESH:
+                        stop_mode = True
+                        stop_start_time = now
+                        prev_max_height = max_height
+                        print("[STOP] Object height >= threshold. Rover stopped.")
+
+                    # 2. 정지 상태
+                    if stop_mode:
+                        # 5초간 정지
+                        if now - stop_start_time < STOP_DURATION:
+                            throttle = 0.0
+                            L = R = 0.0
+                            if base_ctrl is not None:
+                                base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                            print(f"[STOP] {now - stop_start_time:.1f}/{STOP_DURATION}s")
+                        else:
+                            # height 변화가 크지 않으면 서행
+                            if abs(max_height - prev_max_height) < HEIGHT_DIFF_THRESH:
+                                slow_mode = True
+                                stop_mode = False
+                                print("[SLOW] Height changed little after stop, switching to slow mode.")
+                            else:
+                                # height가 충분히 줄었으면 정상 주행 재개
+                                stop_mode = False
+                                print("[RESUME] Height decreased, resume normal driving.")
+                        # 화면 표시, 저장, 로그 등은 아래에서 계속
+                    # 3. 서행 모드 (정지 후 height 변화 적거나, 후진 감지)
+                    elif slow_mode or reverse_mode:
+                        throttle = slow_speed
+                        L = float(np.clip(throttle + steering, -1.0, 1.0))
+                        R = float(np.clip(throttle - steering, -1.0, 1.0))
+                        if base_ctrl is not None:
+                            base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+                        print("[SLOW] Slow driving mode (after stop or reverse detected).")
+                        # slow_mode는 height가 다시 정상 범위로 돌아오면 해제
+                        if max_height < HEIGHT_STOP_THRESH - HEIGHT_DIFF_THRESH and not reverse_mode:
+                            slow_mode = False
+                            print("[RESUME] Height now normal, resume normal driving.")
+                    # 4. 기본: PID 차선 추종 주행
+                    else:
+                        throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
+                        L = float(np.clip(throttle + steering, -1.0, 1.0))
+                        R = float(np.clip(throttle - steering, -1.0, 1.0))
+                        if base_ctrl is not None:
                             base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
 
                     if self.save:
@@ -228,20 +288,17 @@ if __name__ == '__main__':
     parser.add_argument('--baudrate', type=int, default=115200, help='Serial baudrate')
     args = parser.parse_args()
 
-    # 차선 추종 모델 준비
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     lane_model = get_lane_model().to(device)
     lane_model.load_state_dict(torch.load(args.lane_model_file, map_location=device))
     lane_model.eval()
 
-    # Wave Rover 모터 제어기 준비
     try:
         base = BaseController(args.base_serial, args.baudrate)
     except Exception as e:
         print(f"BaseController init failed: {e}")
         base = None
 
-    # 카메라 준비
     cam = Camera(
         sensor_id=args.sensor_id,
         window_title=args.window_title,
@@ -250,11 +307,9 @@ if __name__ == '__main__':
         stream=args.stream,
         log=args.log)
 
-    # YOLO 모델 준비 (선택)
     if args.yolo_model_file:
         classes = YOLO(args.yolo_model_file, task='detect').names
         model = YOLO(args.yolo_model_file, task='detect')
         cam.set_model(model, classes)
 
-    # 메인 루프 실행 (차선 추종 + YOLO 시각화 + height 기반 정지)
     cam.run(lane_model, device, preprocess, base_ctrl=base)
