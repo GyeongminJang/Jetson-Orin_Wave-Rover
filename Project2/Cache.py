@@ -122,10 +122,11 @@ class Camera:
 
     def run(self, lane_model, lane_device, lane_preprocess, base_ctrl=None) -> None:
         # ==================== PID 파라미터 (중앙선 추종) ====================
-        Kp, Kd, Ki = 1.0, 0.15, 0.095
+        Kp, Kd, Ki = 0.3, 0.3, 0.03
+
         turn_threshold = 0.7
         integral_threshold = 0.1
-        integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
+        integral_min, integral_max = -0.2 / Ki, 0.2 / Ki
         cruise_speed, slow_speed = 0.45, 0.35
         prev_err, integral = 0.0, 0.0
         last_time = time.time()
@@ -250,7 +251,7 @@ class Camera:
                         if overtake_phase == "LEFT":
                             if phase_time < overtake_left_duration:
                                 # 좌측 조향
-                                steering = 0.8
+                                steering = 0.55
                                 L = float(np.clip(slow_speed + steering, -1.0, 1.0))
                                 R = float(np.clip(slow_speed - steering, -1.0, 1.0))
                                 if base_ctrl is not None:
@@ -274,7 +275,7 @@ class Camera:
                         elif overtake_phase == "RIGHT":
                             if phase_time < overtake_right_duration:
                                 # 우측 조향(차선 복귀)
-                                steering = -0.8
+                                steering = -0.5
                                 L = float(np.clip(slow_speed + steering, -1.0, 1.0))
                                 R = float(np.clip(slow_speed - steering, -1.0, 1.0))
                                 if base_ctrl is not None:
