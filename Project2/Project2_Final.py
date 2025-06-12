@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Sequence
-import argparse
-import cv2
-import datetime
-import logging
-import numpy as np
-import os
 import time
+import numpy as np
+import cv2
 import torch
 import torchvision
 import PIL.Image
@@ -18,138 +12,114 @@ from jetcam.csi_camera import CSICamera
 from base_ctrl import BaseController
 from ultralytics import YOLO
 
-logging.getLogger().setLevel(logging.INFO)
-
-def draw_boxes(image, pred, classes, colors):
-    """YOLOv8 탐지 결과 시각화 (높이 정보 추가)"""
-    for r in pred:
-        for box in r.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            score = round(float(box.conf[0]), 2)
-            label = int(box.cls[0])
-            height = y2 - y1  # 높이 계산
-            color = colors[label].tolist()
-            cls_name = classes[label]
-            cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(image,
-                        f"{cls_name} {score} H:{height}px",
-                        (x1, max(0, y1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1,
-                        cv2.LINE_AA)
+# ========== 모델 및 하드웨어 초기화 ==========
+yolo_model = YOLO('best.pt')
+yolo_names = yolo_model.names
 
 def get_lane_model():
-    # 차선 추종용 CNN(AlexNet) 모델 생성
     return torchvision.models.alexnet(num_classes=2, dropout=0.0)
 
-def preprocess(image: PIL.Image.Image, device):
-    # 이미지 전처리 함수 (텐서 변환 및 배치 차원 추가)
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+lane_model = get_lane_model().to(device)
+lane_model.load_state_dict(torch.load('road_following_model.pth', map_location=device))
+lane_model.eval()
+
+def preprocess(image: PIL.Image.Image):
     return TEST_TRANSFORMS(image).to(device)[None, ...]
 
-class Camera:
-    def __init__(
-        self,
-        sensor_id: int | Sequence[int] = 0,
-        width: int = 1280,
-        height: int = 720,
-        _width: int = 1280,
-        _height: int = 720,
-        frame_rate: int = 30,
-        flip_method: int = 0,
-        window_title: str = "Camera",
-        save_path: str = "record",
-        stream: bool = False,
-        save: bool = False,
-        log: bool = True,
-    ) -> None:
-        self.sensor_id = sensor_id
-        self.width = width
-        self.height = height
-        self._width = _width
-        self._height = _height
-        self.frame_rate = frame_rate
-        self.flip_method = flip_method
-        self.window_title = window_title
-        self.save_path = Path(save_path)
-        self.stream = stream
-        self.save = save
-        self.log = log
-        self.model = None
+base = BaseController('/dev/ttyUSB0', 115200)
+camera = CSICamera(capture_width=1280, capture_height=720, downsample=2, capture_fps=30)
 
-        if isinstance(sensor_id, int):
-            self.sensor_id = [sensor_id]
-        elif isinstance(sensor_id, Sequence) and len(sensor_id) > 1:
-            raise NotImplementedError("Multiple cameras are not supported yet")
+# ========== PID 파라미터 ==========
+Kp, Kd, Ki = 1.0, 0.15, 0.095
+turn_threshold = 0.7
+integral_threshold = 0.1
+integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
+cruise_speed, slow_speed = 0.5, 0.4
 
-        self.cap = [cv2.VideoCapture(self.gstreamer_pipeline(sensor_id=id),
-                        cv2.CAP_GSTREAMER) for id in self.sensor_id]
+print("Ready... (Wave Rover Full Obstacle Avoidance Flow)")
 
-        if save:
-            os.makedirs(self.save_path, exist_ok=True)
-            self.save_path = self.save_path / f'{len(os.listdir(self.save_path)) + 1:06d}'
-            os.makedirs(self.save_path, exist_ok=True)
-            logging.info(f"Save directory: {self.save_path}")
+execution, prev_err, integral = True, 0.0, 0.0
+last_time = time.time()
 
-    def gstreamer_pipeline(self, sensor_id: int) -> str:
-        return (
-            "nvarguscamerasrc sensor-id=%d ! "
-            "video/x-raw(memory:NVMM), width=(int)%d, height=(int)%d, framerate=(fraction)%d/1 ! "
-            "nvvidconv flip-method=%d ! "
-            "video/x-raw, width=(int)%d, height=(int)%d, format=(string)BGRx ! "
-            "videoconvert ! "
-            "video/x-raw, format=(string)BGR ! appsink"
-            % (
-                sensor_id,
-                self.width,
-                self.height,
-                self.frame_rate,
-                self.flip_method,
-                self._width,
-                self._height,
-            )
-        )
+# ========== 상태 변수 ==========
+stop_start_time = None
+stop_duration = 5
+stop_done_once = False
+vehicle_detected_recently = False
+vehicle_already_avoided = False
 
-    def set_model(self, model: YOLO, classes: dict) -> None:
-        self.model = model
-        self.classes = classes
-        self.colors = np.random.randn(len(self.classes), 3)
-        self.colors = (self.colors * 255.0).astype(np.uint8)
-        self.visualize_pred_fn = lambda img, pred: draw_boxes(img, pred, self.classes, self.colors)
+avoid_mode = False
+avoid_start_time = None
+avoid_duration = 1.5
 
-    def run(self, lane_model, lane_device, lane_preprocess, base_ctrl=None) -> None:
-        # ==================== PID 파라미터 (중앙선 추종) ====================
-        Kp, Kd, Ki = 1.0, 0.15, 0.095
-        turn_threshold = 0.7
-        integral_threshold = 0.1
-        integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
-        cruise_speed, slow_speed = 0.45, 0.35
-        prev_err, integral = 0.0, 0.0
-        last_time = time.time()
+return_turn_mode = False
+return_turn_start_time = None  # 좌회전 추가 단계
 
-        if self.stream:
-            cv2.namedWindow(self.window_title)
+recovery_mode = False
+recovery_start_time = None
+recovery_duration = 1.25
 
-        if self.cap[0].isOpened():
-            try:
-                while True:
-                    t0 = time.time()
-                    timestamp = datetime.datetime.now().strftime('%Y%m%d%H%M%S%f')
-                    ret, frame = self.cap[0].read()
-                    if not ret:
-                        print("Camera read failed.")
-                        break
+try:
+    while execution:
+        frame_bgr = camera.read()
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        pil_img = PIL.Image.fromarray(frame_rgb)
 
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_img = PIL.Image.fromarray(frame_rgb)
+        results = yolo_model(frame_bgr, stream=False, verbose=False)
+        boxes = results[0].boxes
 
-                    # ===== 차선 추종 CNN(PID) 기반 중앙선 추종 =====
-                    with torch.no_grad():
-                        tensor = lane_preprocess(pil_img, lane_device)
-                        out = lane_model(tensor).cpu().numpy()[0]
+        vehicle_found = False
+        vehicle_height = None
+
+        for box in boxes:
+            cls = int(box.cls[0].item())
+            label = yolo_names[cls]
+            if label == "Vehicle":
+                xyxy = box.xyxy[0].cpu().numpy()
+                x1, y1, x2, y2 = xyxy
+                height = y2 - y1
+                print(f"[Vehicle] Detected - Height: {height:.1f}px")
+                vehicle_found = True
+                vehicle_height = height
+                break
+
+        current_time = time.time()
+
+        # ===== 회피 모드 =====
+        if avoid_mode:
+            if current_time - avoid_start_time < avoid_duration:
+                print("[Avoidance] Executing curved avoidance...")
+                base.base_json_ctrl({"T": 1, "L": 0.475, "R": 0.1})  # 우회전
+                continue
+            else:
+                print("[Avoidance] Done. Starting left turn to return.")
+                avoid_mode = False
+                return_turn_mode = True
+                return_turn_start_time = current_time
+                continue
+
+        # ===== 좌회전 복귀 모드 =====
+        if return_turn_mode:
+            if current_time - return_turn_start_time < avoid_duration:
+                print("[Return Turn] Executing left turn to return...")
+                base.base_json_ctrl({"T": 1, "L": 0.1, "R": 0.48})  # 우회전의 반대
+                continue
+            else:
+                print("[Return Turn] Done. Entering recovery mode.")
+                return_turn_mode = False
+                recovery_mode = True
+                recovery_start_time = current_time
+                continue
+
+        # ===== 복구 모드 =====
+        if recovery_mode:
+            if current_time - recovery_start_time < recovery_duration:
+                print("[Recovery] PID lane following during recovery...")
+                with torch.no_grad():
+                    tensor = preprocess(pil_img)
+                    out = lane_model(tensor).cpu().numpy()[0]
                     err = float(out[0])
-
                     now = time.time()
                     dt = max(1e-3, now - last_time)
                     last_time = now
@@ -160,99 +130,79 @@ class Camera:
                         integral = np.clip(integral + err * dt, integral_min, integral_max)
 
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
+                    steering *= 0.7  # 70%로 감쇠
                     prev_err = err
 
-                    throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
+                    throttle = slow_speed
+                    steering = np.clip(steering, -0.3, 0.3)
+                    L = float(np.clip(throttle + steering, -1.0, 1.0))
+                    R = float(np.clip(throttle - steering, -1.0, 1.0))
+                    base.base_json_ctrl({"T": 1, "L": L, "R": R})
+                continue
+            else:
+                print("[Recovery] Recovery complete. Returning to normal driving.")
+                recovery_mode = False
+                stop_start_time = None
+                stop_done_once = False
+                vehicle_detected_recently = False
+                vehicle_already_avoided = True
+                continue
 
-                    # ===== YOLO 탐지 및 height 판별 =====
-                    stop_due_to_height = False
-                    max_height = 0
-                    if self.model is not None:
-                        pred = list(self.model(frame, stream=True))
-                        for r in pred:
-                            for box in r.boxes:
-                                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                                height = y2 - y1
-                                print(f"[HEIGHT] {height}px")
-                                if height > max_height:
-                                    max_height = height
-                        self.visualize_pred_fn(frame, pred)
+        # ===== 차량 정지 조건 확인 =====
+        if vehicle_height is not None and vehicle_height >= 250:
+            if vehicle_already_avoided:
+                print("[Vehicle] Already avoided. Ignoring.")
+            else:
+                vehicle_detected_recently = True
+                if not stop_done_once:
+                    if stop_start_time is None:
+                        print("[Vehicle] Stop initiated.")
+                        stop_start_time = current_time
+                    elif current_time - stop_start_time < stop_duration:
+                        print(f"[Vehicle] Waiting... ({current_time - stop_start_time:.1f}s)")
+                        base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
+                        continue
+                    else:
+                        print("[Vehicle] Max wait reached. Starting avoidance.")
+                        stop_done_once = True
+                        avoid_mode = True
+                        avoid_start_time = current_time
+                        continue
+        else:
+            if not stop_done_once:
+                if vehicle_detected_recently:
+                    print("[Vehicle] Detection lost temporarily — maintaining stop state.")
+                else:
+                    stop_start_time = None
+            vehicle_detected_recently = False
+            vehicle_already_avoided = False
 
-                        # height가 450px 이상이면 정지
-                        if max_height >= 450:
-                            stop_due_to_height = True
+        # ===== 정상 차선 추종 =====
+        with torch.no_grad():
+            tensor = preprocess(pil_img)
+            out = lane_model(tensor).cpu().numpy()[0]
+            err = float(out[0])
+            now = time.time()
+            dt = max(1e-3, now - last_time)
+            last_time = now
 
-                    # ===== Wave Rover 모터 제어 =====
-                    if base_ctrl is not None:
-                        if stop_due_to_height:
-                            base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                            print("[STOP] Object height >= 500px detected. Rover stopped.")
-                        else:
-                            L = float(np.clip(throttle + steering, -1.0, 1.0))
-                            R = float(np.clip(throttle - steering, -1.0, 1.0))
-                            base_ctrl.base_json_ctrl({"T": 1, "L": L, "R": R})
+            if abs(err) > integral_threshold or prev_err * err < 0:
+                integral = 0.0
+            else:
+                integral = np.clip(integral + err * dt, integral_min, integral_max)
 
-                    if self.save:
-                        cv2.imwrite(str(self.save_path / f"{timestamp}.jpg"), frame)
+            steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
+            prev_err = err
 
-                    if self.log:
-                        print(f"FPS: {1 / (time.time() - t0):.2f}")
+            throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
+            L = float(np.clip(throttle + steering, -1.0, 1.0))
+            R = float(np.clip(throttle - steering, -1.0, 1.0))
+            base.base_json_ctrl({"T": 1, "L": L, "R": R})
 
-                    if self.stream:
-                        cv2.imshow(self.window_title, frame)
-                        if cv2.waitKey(1) == ord('q'):
-                            break
+except KeyboardInterrupt:
+    print("KeyboardInterrupt - Stopping...")
 
-            except Exception as e:
-                print(e)
-            finally:
-                self.cap[0].release()
-                cv2.destroyAllWindows()
-                if base_ctrl is not None:
-                    base_ctrl.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                    print("Motors stopped.")
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--sensor_id', type=int, default=0, help='Camera ID')
-    parser.add_argument('--window_title', type=str, default='Camera', help='OpenCV window title')
-    parser.add_argument('--save_path', type=str, default='record', help='Image save path')
-    parser.add_argument('--save', action='store_true', help='Save frames to save_path')
-    parser.add_argument('--stream', action='store_true', help='Show livestream')
-    parser.add_argument('--log', action='store_true', help='Print FPS')
-    parser.add_argument('--yolo_model_file', type=str, default=None, help='YOLO model file')
-    parser.add_argument('--lane_model_file', type=str, default='road_following_model.pth', help='Lane model file')
-    parser.add_argument('--base_serial', type=str, default='/dev/ttyUSB0', help='WaveRover serial port')
-    parser.add_argument('--baudrate', type=int, default=115200, help='Serial baudrate')
-    args = parser.parse_args()
-
-    # 차선 추종 모델 준비
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    lane_model = get_lane_model().to(device)
-    lane_model.load_state_dict(torch.load(args.lane_model_file, map_location=device))
-    lane_model.eval()
-
-    # Wave Rover 모터 제어기 준비
-    try:
-        base = BaseController(args.base_serial, args.baudrate)
-    except Exception as e:
-        print(f"BaseController init failed: {e}")
-        base = None
-
-    # 카메라 준비
-    cam = Camera(
-        sensor_id=args.sensor_id,
-        window_title=args.window_title,
-        save_path=args.save_path,
-        save=args.save,
-        stream=args.stream,
-        log=args.log)
-
-    # YOLO 모델 준비 (선택)
-    if args.yolo_model_file:
-        classes = YOLO(args.yolo_model_file, task='detect').names
-        model = YOLO(args.yolo_model_file, task='detect')
-        cam.set_model(model, classes)
-
-    # 메인 루프 실행 (차선 추종 + YOLO 시각화 + height 기반 정지)
-    cam.run(lane_model, device, preprocess, base_ctrl=base)
+finally:
+    camera.release()
+    base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
+    print("Terminated")
