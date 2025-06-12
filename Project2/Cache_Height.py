@@ -13,8 +13,8 @@ from base_ctrl import BaseController
 from ultralytics import YOLO
 
 # ========== 모델 및 하드웨어 초기화 ==========
-yolo_model = YOLO('best.pt')  # YOLO 객체 탐지 모델 로드
-yolo_names = yolo_model.names  # 클래스 이름 리스트
+yolo_model = YOLO('best.pt')
+yolo_names = yolo_model.names
 
 def get_lane_model():
     return torchvision.models.alexnet(num_classes=2, dropout=0.0)
@@ -37,24 +37,28 @@ integral_threshold = 0.1
 integral_min, integral_max = -0.4 / Ki, 0.4 / Ki
 cruise_speed, slow_speed = 0.5, 0.4
 
-print("Ready... (Wave Rover with Obstacle Avoidance + Recovery)")
+print("Ready... (Wave Rover Full Obstacle Avoidance Flow)")
 
 execution, prev_err, integral = True, 0.0, 0.0
 last_time = time.time()
 
-# ========== 상태 관리 ==========
+# ========== 상태 변수 ==========
 stop_start_time = None
 stop_duration = 5
 stop_done_once = False
 vehicle_detected_recently = False
+vehicle_already_avoided = False
 
 avoid_mode = False
 avoid_start_time = None
-avoid_duration = 2.0
+avoid_duration = 1.5
+
+return_turn_mode = False
+return_turn_start_time = None  # 좌회전 추가 단계
 
 recovery_mode = False
 recovery_start_time = None
-recovery_duration = 1.0
+recovery_duration = 1.25
 
 try:
     while execution:
@@ -86,16 +90,29 @@ try:
         if avoid_mode:
             if current_time - avoid_start_time < avoid_duration:
                 print("[Avoidance] Executing curved avoidance...")
-                base.base_json_ctrl({"T": 1, "L": 0.45, "R": 0.1})
+                base.base_json_ctrl({"T": 1, "L": 0.475, "R": 0.1})  # 우회전
                 continue
             else:
-                print("[Avoidance] Done. Entering straight recovery mode.")
+                print("[Avoidance] Done. Starting left turn to return.")
                 avoid_mode = False
+                return_turn_mode = True
+                return_turn_start_time = current_time
+                continue
+
+        # ===== 좌회전 복귀 모드 =====
+        if return_turn_mode:
+            if current_time - return_turn_start_time < avoid_duration:
+                print("[Return Turn] Executing left turn to return...")
+                base.base_json_ctrl({"T": 1, "L": 0.1, "R": 0.48})  # 우회전의 반대
+                continue
+            else:
+                print("[Return Turn] Done. Entering recovery mode.")
+                return_turn_mode = False
                 recovery_mode = True
                 recovery_start_time = current_time
                 continue
 
-        # ===== 회피 후 복구 모드 =====
+        # ===== 복구 모드 =====
         if recovery_mode:
             if current_time - recovery_start_time < recovery_duration:
                 print("[Recovery] PID lane following during recovery...")
@@ -113,6 +130,7 @@ try:
                         integral = np.clip(integral + err * dt, integral_min, integral_max)
 
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
+                    steering *= 0.7  # 70%로 감쇠
                     prev_err = err
 
                     throttle = slow_speed
@@ -127,24 +145,29 @@ try:
                 stop_start_time = None
                 stop_done_once = False
                 vehicle_detected_recently = False
+                vehicle_already_avoided = True
+                continue
 
         # ===== 차량 정지 조건 확인 =====
         if vehicle_height is not None and vehicle_height >= 250:
-            vehicle_detected_recently = True
-            if not stop_done_once:
-                if stop_start_time is None:
-                    print("[Vehicle] Stop initiated.")
-                    stop_start_time = current_time
-                elif current_time - stop_start_time < stop_duration:
-                    print(f"[Vehicle] Waiting... ({current_time - stop_start_time:.1f}s)")
-                    base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                    continue
-                else:
-                    print("[Vehicle] Max wait reached. Starting avoidance.")
-                    stop_done_once = True
-                    avoid_mode = True
-                    avoid_start_time = current_time
-                    continue
+            if vehicle_already_avoided:
+                print("[Vehicle] Already avoided. Ignoring.")
+            else:
+                vehicle_detected_recently = True
+                if not stop_done_once:
+                    if stop_start_time is None:
+                        print("[Vehicle] Stop initiated.")
+                        stop_start_time = current_time
+                    elif current_time - stop_start_time < stop_duration:
+                        print(f"[Vehicle] Waiting... ({current_time - stop_start_time:.1f}s)")
+                        base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
+                        continue
+                    else:
+                        print("[Vehicle] Max wait reached. Starting avoidance.")
+                        stop_done_once = True
+                        avoid_mode = True
+                        avoid_start_time = current_time
+                        continue
         else:
             if not stop_done_once:
                 if vehicle_detected_recently:
@@ -152,6 +175,7 @@ try:
                 else:
                     stop_start_time = None
             vehicle_detected_recently = False
+            vehicle_already_avoided = False
 
         # ===== 정상 차선 추종 =====
         with torch.no_grad():
