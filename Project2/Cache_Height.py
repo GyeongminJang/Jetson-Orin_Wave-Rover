@@ -46,14 +46,15 @@ last_time = time.time()
 stop_start_time = None
 stop_duration = 5
 stop_done_once = False
+vehicle_detected_recently = False
 
 avoid_mode = False
 avoid_start_time = None
-avoid_duration = 2.0  # 회피 시간 (초)
+avoid_duration = 2.0
 
 recovery_mode = False
 recovery_start_time = None
-recovery_duration = 1.0 # 회피 후 직진 시간 (초)
+recovery_duration = 1.0
 
 try:
     while execution:
@@ -61,7 +62,6 @@ try:
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         pil_img = PIL.Image.fromarray(frame_rgb)
 
-        # ===== YOLO 차량 탐지 =====
         results = yolo_model(frame_bgr, stream=False, verbose=False)
         boxes = results[0].boxes
 
@@ -74,7 +74,6 @@ try:
             if label == "Vehicle":
                 xyxy = box.xyxy[0].cpu().numpy()
                 x1, y1, x2, y2 = xyxy
-                width = x2 - x1
                 height = y2 - y1
                 print(f"[Vehicle] Detected - Height: {height:.1f}px")
                 vehicle_found = True
@@ -83,11 +82,11 @@ try:
 
         current_time = time.time()
 
-        # ===== 회피 동작 (오른쪽 곡선 주행) =====
+        # ===== 회피 모드 =====
         if avoid_mode:
             if current_time - avoid_start_time < avoid_duration:
                 print("[Avoidance] Executing curved avoidance...")
-                base.base_json_ctrl({"T": 1, "L": 0.5, "R": 0.1})  # 오른쪽 곡선
+                base.base_json_ctrl({"T": 1, "L": 0.45, "R": 0.1})
                 continue
             else:
                 print("[Avoidance] Done. Entering straight recovery mode.")
@@ -96,19 +95,42 @@ try:
                 recovery_start_time = current_time
                 continue
 
-        # ===== 회피 후 직진 주행 =====
+        # ===== 회피 후 복구 모드 =====
         if recovery_mode:
             if current_time - recovery_start_time < recovery_duration:
-                print("[Recovery] Going straight after avoidance...")
-                base.base_json_ctrl({"T": 1, "L": 0.5, "R": 0.5})  # 직진
+                print("[Recovery] PID lane following during recovery...")
+                with torch.no_grad():
+                    tensor = preprocess(pil_img)
+                    out = lane_model(tensor).cpu().numpy()[0]
+                    err = float(out[0])
+                    now = time.time()
+                    dt = max(1e-3, now - last_time)
+                    last_time = now
+
+                    if abs(err) > integral_threshold or prev_err * err < 0:
+                        integral = 0.0
+                    else:
+                        integral = np.clip(integral + err * dt, integral_min, integral_max)
+
+                    steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
+                    prev_err = err
+
+                    throttle = slow_speed
+                    steering = np.clip(steering, -0.3, 0.3)
+                    L = float(np.clip(throttle + steering, -1.0, 1.0))
+                    R = float(np.clip(throttle - steering, -1.0, 1.0))
+                    base.base_json_ctrl({"T": 1, "L": L, "R": R})
                 continue
             else:
-                print("[Recovery] Recovery complete. Resuming lane following.")
+                print("[Recovery] Recovery complete. Returning to normal driving.")
                 recovery_mode = False
-                stop_done_once = False  # 다음 차량에 대해 다시 대응 가능
+                stop_start_time = None
+                stop_done_once = False
+                vehicle_detected_recently = False
 
-        # ===== 차량 감지 후 최초 정지 =====
+        # ===== 차량 정지 조건 확인 =====
         if vehicle_height is not None and vehicle_height >= 250:
+            vehicle_detected_recently = True
             if not stop_done_once:
                 if stop_start_time is None:
                     print("[Vehicle] Stop initiated.")
@@ -124,10 +146,14 @@ try:
                     avoid_start_time = current_time
                     continue
         else:
-            stop_start_time = None
-            stop_done_once = False
+            if not stop_done_once:
+                if vehicle_detected_recently:
+                    print("[Vehicle] Detection lost temporarily — maintaining stop state.")
+                else:
+                    stop_start_time = None
+            vehicle_detected_recently = False
 
-        # ===== 차선 추종 PID 제어 =====
+        # ===== 정상 차선 추종 =====
         with torch.no_grad():
             tensor = preprocess(pil_img)
             out = lane_model(tensor).cpu().numpy()[0]
@@ -147,7 +173,6 @@ try:
             throttle = cruise_speed if abs(steering) < turn_threshold else slow_speed
             L = float(np.clip(throttle + steering, -1.0, 1.0))
             R = float(np.clip(throttle - steering, -1.0, 1.0))
-
             base.base_json_ctrl({"T": 1, "L": L, "R": R})
 
 except KeyboardInterrupt:
