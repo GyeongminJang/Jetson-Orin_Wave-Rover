@@ -45,9 +45,8 @@ last_time = time.time()
 # ========== 상태 변수 ==========
 stop_start_time = None
 stop_duration = 5
-stop_done_once = False
 vehicle_detected_recently = False
-vehicle_already_avoided = False
+waiting_due_to_vehicle = False
 
 avoid_mode = False
 avoid_start_time = None
@@ -60,11 +59,13 @@ recovery_mode = False
 recovery_start_time = None
 recovery_duration = 1.25
 
-# ===== 후진 탐지 변수 =====
-recent_vehicle_heights = []
-max_history = 5
-reverse_detected = False
-reverse_trigger_threshold = 40
+# ========== 후진 판단 관련 변수 ==========
+height_history = []
+centerY_history = []
+centerY_time_history = []
+reverse_check_window = 3
+reverse_height_drop_thresh = 60
+reverse_velocity_thresh = 700.0  # px/sec 기준값
 
 try:
     while execution:
@@ -77,6 +78,7 @@ try:
 
         vehicle_found = False
         vehicle_height = None
+        centerY = None
 
         for box in boxes:
             cls = int(box.cls[0].item())
@@ -85,35 +87,13 @@ try:
                 xyxy = box.xyxy[0].cpu().numpy()
                 x1, y1, x2, y2 = xyxy
                 height = y2 - y1
-                print(f"[Vehicle] Detected - Height: {height:.1f}px")
+                centerY = (y1 + y2) / 2
+                print(f"[Vehicle] Detected - Height: {height:.1f}px, centerY: {centerY:.1f}")
                 vehicle_found = True
                 vehicle_height = height
                 break
 
         current_time = time.time()
-
-        # ===== vehicle height 변화 기반 후진 판단 =====
-        if vehicle_height is not None:
-            recent_vehicle_heights.append(vehicle_height)
-            if len(recent_vehicle_heights) > max_history:
-                recent_vehicle_heights.pop(0)
-
-            if len(recent_vehicle_heights) >= max_history:
-                delta = recent_vehicle_heights[-1] - recent_vehicle_heights[0]
-                if delta > reverse_trigger_threshold:
-                    print(f"[Reverse] Detected possible reverse motion. Height change: {delta:.1f}px")
-                    reverse_detected = True
-        else:
-            recent_vehicle_heights.clear()
-
-        # ===== 긴급 회피 (후진 시) =====
-        if reverse_detected and not avoid_mode and not recovery_mode and not return_turn_mode:
-            print("[Reverse] Emergency avoidance due to reverse vehicle.")
-            stop_done_once = True
-            avoid_mode = True
-            avoid_start_time = current_time
-            reverse_detected = False
-            continue
 
         # ===== 회피 모드 =====
         if avoid_mode:
@@ -172,39 +152,68 @@ try:
                 print("[Recovery] Recovery complete. Returning to normal driving.")
                 recovery_mode = False
                 stop_start_time = None
-                stop_done_once = False
                 vehicle_detected_recently = False
-                vehicle_already_avoided = True
+                waiting_due_to_vehicle = False
                 continue
 
-        # ===== 차량 정지 조건 확인 =====
+        # ===== 차량 정지 및 회피 판단 =====
         if vehicle_height is not None and vehicle_height >= 250:
-            if vehicle_already_avoided:
-                print("[Vehicle] Already avoided. Ignoring.")
-            else:
-                vehicle_detected_recently = True
-                if not stop_done_once:
-                    if stop_start_time is None:
-                        print("[Vehicle] Stop initiated.")
-                        stop_start_time = current_time
-                    elif current_time - stop_start_time < stop_duration:
-                        print(f"[Vehicle] Waiting... ({current_time - stop_start_time:.1f}s)")
-                        base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
-                        continue
-                    else:
-                        print("[Vehicle] Max wait reached. Starting avoidance.")
-                        stop_done_once = True
+            height_history.append(vehicle_height)
+            if len(height_history) > reverse_check_window:
+                height_history.pop(0)
+
+            centerY_history.append(centerY)
+            centerY_time_history.append(current_time)
+            if len(centerY_history) > reverse_check_window:
+                centerY_history.pop(0)
+                centerY_time_history.pop(0)
+
+            # ===== centerY 속도 기반 후진 감지 =====
+            if len(centerY_history) >= 2:
+                dy = centerY_history[-1] - centerY_history[-2]
+                dt = centerY_time_history[-1] - centerY_time_history[-2]
+                if dt > 0:
+                    v = dy / dt
+                    print(f"[ReverseCheck] centerY speed = {v:.2f} px/sec")
+                    if v > reverse_velocity_thresh:
+                        print("[Reverse] High-speed reverse detected based on centerY speed.")
                         avoid_mode = True
                         avoid_start_time = current_time
+                        stop_start_time = None
+                        height_history.clear()
+                        centerY_history.clear()
+                        centerY_time_history.clear()
+                        waiting_due_to_vehicle = False
                         continue
+
+            # ===== 정지 및 출발 판단 =====
+            if not waiting_due_to_vehicle:
+                print("[Vehicle] Stop initiated.")
+                stop_start_time = current_time
+                waiting_due_to_vehicle = True
+            elif current_time - stop_start_time < stop_duration:
+                print(f"[Vehicle] Waiting... ({current_time - stop_start_time:.1f}s)")
+                base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
+                continue
+            else:
+                print("[Vehicle] Max wait reached. Starting avoidance.")
+                avoid_mode = True
+                avoid_start_time = current_time
+                stop_start_time = None
+                waiting_due_to_vehicle = False
+                height_history.clear()
+                centerY_history.clear()
+                centerY_time_history.clear()
+                continue
         else:
-            if not stop_done_once:
-                if vehicle_detected_recently:
-                    print("[Vehicle] Detection lost temporarily — maintaining stop state.")
-                else:
-                    stop_start_time = None
+            if waiting_due_to_vehicle:
+                print("[Vehicle] Cleared. Resuming drive.")
+            stop_start_time = None
             vehicle_detected_recently = False
-            vehicle_already_avoided = False
+            waiting_due_to_vehicle = False
+            height_history.clear()
+            centerY_history.clear()
+            centerY_time_history.clear()
 
         # ===== 정상 차선 추종 =====
         with torch.no_grad():
@@ -235,4 +244,3 @@ finally:
     camera.release()
     base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
     print("Terminated")
-
