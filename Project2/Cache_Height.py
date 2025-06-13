@@ -235,3 +235,4 @@ finally:
     camera.release()
     base.base_json_ctrl({"T": 1, "L": 0.0, "R": 0.0})
     print("Terminated")
+
