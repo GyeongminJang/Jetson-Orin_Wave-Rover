@@ -54,11 +54,17 @@ avoid_start_time = None
 avoid_duration = 1.5
 
 return_turn_mode = False
-return_turn_start_time = None  # 좌회전 추가 단계
+return_turn_start_time = None
 
 recovery_mode = False
 recovery_start_time = None
 recovery_duration = 1.25
+
+# ===== 후진 탐지 변수 =====
+recent_vehicle_heights = []
+max_history = 5
+reverse_detected = False
+reverse_trigger_threshold = 40
 
 try:
     while execution:
@@ -86,11 +92,34 @@ try:
 
         current_time = time.time()
 
+        # ===== vehicle height 변화 기반 후진 판단 =====
+        if vehicle_height is not None:
+            recent_vehicle_heights.append(vehicle_height)
+            if len(recent_vehicle_heights) > max_history:
+                recent_vehicle_heights.pop(0)
+
+            if len(recent_vehicle_heights) >= max_history:
+                delta = recent_vehicle_heights[-1] - recent_vehicle_heights[0]
+                if delta > reverse_trigger_threshold:
+                    print(f"[Reverse] Detected possible reverse motion. Height change: {delta:.1f}px")
+                    reverse_detected = True
+        else:
+            recent_vehicle_heights.clear()
+
+        # ===== 긴급 회피 (후진 시) =====
+        if reverse_detected and not avoid_mode and not recovery_mode and not return_turn_mode:
+            print("[Reverse] Emergency avoidance due to reverse vehicle.")
+            stop_done_once = True
+            avoid_mode = True
+            avoid_start_time = current_time
+            reverse_detected = False
+            continue
+
         # ===== 회피 모드 =====
         if avoid_mode:
             if current_time - avoid_start_time < avoid_duration:
                 print("[Avoidance] Executing curved avoidance...")
-                base.base_json_ctrl({"T": 1, "L": 0.475, "R": 0.1})  # 우회전
+                base.base_json_ctrl({"T": 1, "L": 0.475, "R": 0.1})
                 continue
             else:
                 print("[Avoidance] Done. Starting left turn to return.")
@@ -103,7 +132,7 @@ try:
         if return_turn_mode:
             if current_time - return_turn_start_time < avoid_duration:
                 print("[Return Turn] Executing left turn to return...")
-                base.base_json_ctrl({"T": 1, "L": 0.1, "R": 0.48})  # 우회전의 반대
+                base.base_json_ctrl({"T": 1, "L": 0.1, "R": 0.48})
                 continue
             else:
                 print("[Return Turn] Done. Entering recovery mode.")
@@ -130,7 +159,7 @@ try:
                         integral = np.clip(integral + err * dt, integral_min, integral_max)
 
                     steering = Kp * err + Kd * (err - prev_err) / dt + Ki * integral
-                    steering *= 0.7  # 70%로 감쇠
+                    steering *= 0.7
                     prev_err = err
 
                     throttle = slow_speed
