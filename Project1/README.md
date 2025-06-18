@@ -71,8 +71,12 @@ This project implements an autonomous driving system that enables a robot vehicl
 
 ## 📂 File Structure
 
-- `ctrl_with_keyboard.py`: Manually control the Wave Rover using the keyboard.
-- `self_lanetracking.py`: The Wave Rover autonomously follows the lane center using a trained `.pth` file.
+| Filename                   | Description                                                                                       |
+|----------------------------|---------------------------------------------------------------------------------------------------|
+| **Project1_final.py**      | The main Python script that runs the project's core logic, including model inference and control. |
+| **best.pt**                | Trained PyTorch model file for general use (e.g., lane following or object detection).            |
+| **best_intersection.pt**   | Trained PyTorch model file specialized for intersection scenarios.                                |
+| **best_straight.pt**       | Trained PyTorch model file specialized for straight road scenarios.                               |
 
 ---
 
