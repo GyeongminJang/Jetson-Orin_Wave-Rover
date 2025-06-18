@@ -1,6 +1,6 @@
 ## pth_file Download
 
-[pth file download](https://drive.google.com/file/d/11bUNvItHpPUm0wBu_FwN6G-8PyS9BxvC/view?usp=drive_link)
+[pth file download](https://drive.google.com/file/d/11bUNvItHpPUm0wBu_FwN6G-8PyS9BxvC/view?usp=drive_link) (Google Drive Link)
 
 ## Contents
 1. ctrl_with_keyboard.py: You can control the Wave Rover using the keyboard.
