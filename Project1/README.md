@@ -65,7 +65,7 @@ This project implements an autonomous driving system that enables a robot vehicl
 - **Object Detection Limitations:**  
   - Some objects may not be recognized even after labeling and training.
   - The system is designed to use as much contextual information as possible for robust driving.
-  - Occasionally, unrelated objects (e.g., empty spaces, chairs, fire extinguishers) may be misclassified as vehicles.
+  - Occasionally, unrelated objects (e.g., empty spaces, chairs, light extinguishers) may be misclassified as vehicles.
 
 ---
 
