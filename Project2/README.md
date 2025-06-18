@@ -28,7 +28,7 @@ This project implements intelligent vehicle detection, stopping, overtaking (avo
 | Filename                  | Description                                                                                         |
 |---------------------------|-----------------------------------------------------------------------------------------------------|
 | **Project2_Final.py**     | Main script that integrates vehicle detection, stopping, overtaking (avoidance), and lane recovery. |
-| **demo_livecam_local.py** | Script for running real-time live camera demonstrations and testing the system locally.              |
+| **demo_livecam_local.py** | Sub Script for running real-time live camera demonstrations and testing the system locally.              |
 | **vehicle_height.py**     | Module for detecting vehicle height and determining stop/avoidance conditions.                      |
 
 ---
