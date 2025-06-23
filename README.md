@@ -9,11 +9,11 @@ Jetson Orin Nano + Wave Rover
 
 1) Traffic Light
 
-  ![Wave Rover 1](gifs/Traffic_Light.gif)
+ ![Wave Rover 1](gifs/Traffic_Light.gif)
 
 2-1) Slow Sign 
 
-![Wave Rover 1](gifs/Slow_Sign.gif)
+ ![Wave Rover 1](gifs/Slow_Sign.gif)
 
 2-2) Stop Sign
    
@@ -34,6 +34,30 @@ Jetson Orin Nano + Wave Rover
 4-3) Turn Right
 
  ![Wave Rover 1](gifs/Right_Turn.gif)
+
+---
+
+## Project 2 Results
+
+1) Stop and Following
+
+ ![Wave Rover 1](gifs/Following.gif)
+
+2) Stop and Avoidance
+
+ ![Wave Rover 1](gifs/Avoidance.gif)
+  
+3) Interruption and Stop
+
+ ![Wave Rover 1](gifs/Interruption_Stop.gif)
+ 
+4) Interruption and Following
+
+ ![Wave Rover 1](gifs/Interruption_Following.gif)
+
+5) Interruption and Avoidance
+
+ ![Wave Rover 1](gifs/Interruption_Avoidance.gif)
 
 ---
 
