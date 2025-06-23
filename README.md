@@ -46,6 +46,8 @@ Jetson Orin Nano + Wave Rover
 2) Stop and Avoidance
 
  ![Wave Rover 1](gifs/Stop_Avoidance.gif)
+Sorry the gif didn't show up.
+You can view the GIF via ![the link](gifs/Stop_Avoidance.gif) instead.
   
 3) Interruption and Stop
 
