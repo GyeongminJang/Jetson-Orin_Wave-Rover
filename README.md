@@ -7,9 +7,9 @@ Jetson Orin Nano + Wave Rover
 
 ## Project 1 Results
 
-1) Original Moving
+1) Traffic Light
 
-  ![Wave Rover 1](gifs/Original.gif)
+  ![Wave Rover 1](gifs/Traffic_Light.gif)
 
 ---
 
