@@ -13,7 +13,7 @@ Jetson Orin Nano + Wave Rover
 
 2) Slow and Stop Sign
    
-  ![Wave Rover 1](gifs/Slow_Sign.gif)   ![Wave Rover 1](gifs/Stop_Sign.gif)
+  ![Wave Rover 1](gifs/Slow_Sign.gif)![Wave Rover 1](gifs/Stop_Sign.gif)
 
 3) Avoidance
 
@@ -21,7 +21,7 @@ Jetson Orin Nano + Wave Rover
 
 4) Turn Left / Straight / Turn Right
 
-  ![Wave Rover 1](gifs/Left_Turn.gif)   ![Wave Rover 1](gifs/Straight.gif)   ![Wave Rover 1](gifs/Right_Turn.gif)
+  ![Wave Rover 1](gifs/Left_Turn.gif)![Wave Rover 1](gifs/Straight.gif)![Wave Rover 1](gifs/Right_Turn.gif)
 
 ---
 
